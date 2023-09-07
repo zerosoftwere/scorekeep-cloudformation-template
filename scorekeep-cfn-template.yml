@@ -1,0 +1,369 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS CloudFormation template to create a new VPC
+  or use an existing VPC for ECS deployment
+  in Create Cluster Wizard. Requires exactly 1
+  Instance Types for a Sport Request
+
+Parameters:
+  Email:
+    Type: String
+    Description: Enter a valid email address.
+  FrontendImageUri:
+    Type: String
+    Default: public.ecr.aws/xray/scorekeep-frontend:latest
+  BackendImageUri:
+    Type: String
+    Default: public.ecr.aws/xray/scorekeep-api:latest
+  EcsClusterName:
+    Type: String
+    Description: >
+      Specifies the ECS Cluster Name with which the resources would be associated.
+    Default: scorekeep-cluster
+  LatestAmiId:
+    Description: AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+  InstanceType:
+    Type: String
+    Description: >
+      Specifies the EC2 instance type for your container instances.
+      Defaults to t3.micro
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: >
+      Optional - Specifies the name of an existing Amazon EC2 key pair
+      to enable SSH access to the EC2 instances in your cluster
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: >
+      Optional - Specifies the Security Group Id of an exising Security Group. Leave blank to have a new Security Group Created.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Specifies the name of subnet to launch the instances and loadbalancer. Select at least 2
+    ConstraintDescription: You must select at least two subnet id from the same vpc.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  AsgMaxSize:
+    Type: Number
+    Description: >
+      Specifies the max number of instances to launch and register to the cluster.
+      Defaults to 3.
+    Default: '3'
+  AsgDesiredCapacity:
+    Type: Number
+    Description: >
+      Specifies the desired number of instances to launch and register to the cluster.
+      Defaults to 1.
+    Default: '1'
+  IamRoleInstanceProfile:
+    Type: String
+    Description: >
+      Specifies the Name or the Amazon Resource Name (ARN) of the instance profile associated with the the IAM role for the instance.
+    Default: ScoreKeepInstanceProfile
+
+Resources:
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref EcsClusterName  
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ScorekeepECSRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Effect: Allow
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceForEC2Role
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    DependsOn: ClusterRole
+    Properties:
+      InstanceProfileName: !Ref IamRoleInstanceProfile
+      Roles:
+        - !Ref ClusterRole
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: EcsCluster
+    Properties:
+      LaunchTemplateName: ECSStack
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+        SecurityGroupIds: !Ref SecurityGroupIds
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetIds
+      HealthCheckGracePeriod: 60
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      NewInstancesProtectedFromScaleIn: true
+      MinSize: '0'
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+        ManagedTerminationProtection: ENABLED
+  ClusterCapacityProviderAssociation:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      CapacityProviders:
+        - !Ref CapacityProvider
+      Cluster: !Ref EcsCluster
+      DefaultCapacityProviderStrategy:
+        - Base: 2
+          Weight: 6
+          CapacityProvider: !Ref CapacityProvider
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ECSExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+  ScorekeepTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ScorekeepTaskRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        - arn:aws:iam::aws:policy/AWSXrayFullAccess
+  UserTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: scorekeep-user
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: scorekeep-session
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+  GameTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: scorekeep-game
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: session
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: session-index
+          KeySchema:
+            - AttributeName: session
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 2
+            WriteCapacityUnits: 2
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+  MoveTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: scorekeep-move
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: game
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: game-index
+          KeySchema:
+            - AttributeName: game
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 2
+            WriteCapacityUnits: 2
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+  StateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: scorekeep-state
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: game
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: game-index
+          KeySchema:
+            - AttributeName: game
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 2
+            WriteCapacityUnits: 2
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: scorekeep-notification
+  ScorekeepTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: '1024'
+      ExecutionRoleArn: !Ref ECSExecutionRole
+      Family: scorekeep
+      NetworkMode: host
+      RequiresCompatibilities:
+        - EC2
+      TaskRoleArn: !Ref ScorekeepTaskRole
+      ContainerDefinitions:
+        - Image: !Ref FrontendImageUri
+          Name: scorekeep-frontend
+          Cpu: 256
+          MemoryReservation: 256
+          PortMappings:
+            - ContainerPort: 80
+        - Image: !Ref BackendImageUri
+          Name: scorekeep-api
+          MemoryReservation: 512
+          Cpu: 256
+          Environment:
+            - Name: AWS_REGION
+              Value: !Sub ${AWS::Region}
+            - Name: NOTIFICATION_TOPIC
+              Value: !GetAtt NotificationTopic.TopicArn
+            - Name: NOTIFICATION_EMAIL
+              Value: !Ref Email
+        - Image: amazon/aws-xray-daemon
+          Name: xray-daemon
+          Essential: true
+          MemoryReservation: 128
+          PortMappings:
+            - ContainerPort: 2000
+              HostPort: 2000
+              Protocol: udp
+  ScorekeepService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ScorekeepTaskDefinition
+      - UserTable
+      - SessionTable
+      - GameTable
+      - StateTable
+      - CapacityProvider
+    Properties:
+      Cluster: !Ref EcsCluster
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      DesiredCount: 1
+      LaunchType: EC2
+      SchedulingStrategy: REPLICA
+      ServiceName: scorekeep-service
+      TaskDefinition: !Ref ScorekeepTaskDefinition
+      LoadBalancers:
+        - ContainerName: scorekeep-frontend
+          ContainerPort: 80
+          TargetGroupArn: !Ref ScorekeepTargetGroup
+  ScorekeepTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: ScorekeepTargetGroup
+      TargetType: instance
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+  ScorekeepLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: ScorekeepTargetGroup
+    Properties:
+      Name: Scorekeep-LB
+      Scheme: internet-facing
+      SecurityGroups: !Ref SecurityGroupIds
+      Type: application
+      Subnets: !Ref SubnetIds
+  ScorekeepLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ScorekeepTargetGroup
+      LoadBalancerArn: !Ref ScorekeepLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+Outputs:
+  LoadbalancerUrl:
+    Description: The URL of the ALB
+    Value: !GetAtt ScorekeepLoadBalancer.DNSName
